@@ -1,0 +1,19 @@
+# Intraday Volatility Breakout — Requirements
+# Install with: pip install -r requirements.txt
+
+# --- Data download (alpaca_download.py) ---
+requests>=2.31.0            # HTTP calls to the Alpaca API
+python-dateutil>=2.8.2      # date parsing
+python-dotenv>=1.0.0        # ALPACA_API_KEY / ALPACA_SECRET_KEY from .env
+tqdm>=4.66.0                # download progress bars
+
+# --- Pipeline (filter_trades.py, build_symbol_portfolios.py) ---
+pandas>=2.0.0
+numpy>=1.24.0
+
+# --- Analysis & dashboard (dashboard.py) ---
+scipy>=1.11.0               # skew, kurtosis, normal fit
+streamlit>=1.30.0
+plotly>=5.18.0
+watchdog>=3.0.0             # faster Streamlit auto-reload
+matplotlib>=3.7.0           # charts outside the dashboard
