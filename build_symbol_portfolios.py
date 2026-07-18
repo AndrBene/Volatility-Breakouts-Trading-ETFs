@@ -88,8 +88,8 @@ def simulate_symbol(sym_trades: pd.DataFrame, atr_lookup: dict) -> tuple[pd.Data
             continue
 
         # ---- position sizing (per-symbol equity) ----------------------
-        risk_dollars = equity * RISK_PER_TRADE / 100.0
-        stop_distance = STOPLOSS_MULTIPLIER * atr
+        risk_dollars = equity * RISK_PER_TRADE / 100.0 # willinng loss per trade (N shares)
+        stop_distance = STOPLOSS_MULTIPLIER * atr # willing loss per share
         shares = math.floor(risk_dollars / stop_distance)
 
         max_shares = math.floor(equity * MAX_POSITION_PCT / 100.0 / t.PriceIn)
