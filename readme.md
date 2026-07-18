@@ -1,6 +1,8 @@
 # Volatility Breakout Trading: A Systematic Strategy for ETFs
 
-This project backtests a systematic trading strategy on US index ETFs (SPY, QQQ, …), based on intraday volatility breakouts measured through ATR. The Python pipeline downloads historical 1-minute data from Alpaca APIs, simulates the breakout trades, sizes them into per-ETF portfolios, and analyzes the results in a Streamlit dashboard.
+This strategy is based on the concept that markets move from periods of low volatility to high volatility, and the transition can open up good trading opportunities. In this project I identify periods of low volatility and enter in the direction of the move when there is an expansion in volatility (breakout), with the assumption that the move will continue in the same direction.
+
+The project backtests a systematic strategy on US index ETFs (SPY, QQQ, …), based on intraday volatility breakouts measured through ATR. The Python pipeline downloads historical 1-minute data from Alpaca APIs, simulates the breakout trades, sizes them into per-ETF portfolios, and analyzes the results in a Streamlit dashboard.
 
 ## The Strategy Rules
 
@@ -54,6 +56,16 @@ Alpaca API keys — set as environment variables before downloading:
 ```bash
 export ALPACA_API_KEY="your_key"
 export ALPACA_SECRET_KEY="your_secret"
+```
+
+## Full pipeline (the short version)
+
+```bash
+python alpaca_download.py
+python intraday_breakout_backtester.py
+python filter_trades.py --trades-file BRK_trades.csv --trades-dir RT_trades --out-dir RT_output
+python build_symbol_portfolios.py --in-dir RT_output
+streamlit run dashboard.py
 ```
 
 ## Files
