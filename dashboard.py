@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import os
+import math
 
 import numpy as np
 import pandas as pd
@@ -27,7 +28,6 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
 
-# ACCOUNT_SIZE = 25_000.0        # must match build_symbol_portfolios.py
 TRADING_DAYS_PER_YEAR = 252
 
 st.set_page_config(page_title="Intraday Breakout - Per-ETF Portfolios", layout="wide")
@@ -69,15 +69,14 @@ def load_daily_close(data_dir: str, symbol: str) -> pd.Series | None:
     return daily
 
 
-def buy_hold_curve(daily_close: pd.Series,
-                   start: float) -> pd.Series:
+def buy_hold_curve(daily_close: pd.Series, start: float) -> pd.Series:
     """Equity from buying `start` worth at the first close and holding."""
-    shares = start / daily_close.iloc[0]
+    shares = math.floor(start / daily_close.iloc[0])
     return (shares * daily_close).rename("Buy & hold")
 
 
-def equity_from_trades(trades: pd.DataFrame, pnl_col: str,
-                       start: float) -> pd.Series:
+def equity_from_trades(trades: pd.DataFrame, pnl_col: str, start: float) -> pd.Series:
+    """Cumulative equity curve indexed by exit date."""
     if trades.empty:
         return pd.Series(dtype=float)
     daily = trades.sort_values("DateOut").groupby(trades["DateOut"].dt.date)[pnl_col].sum()
@@ -95,16 +94,43 @@ def max_drawdown(equity: pd.Series):
     return dd.min(), (dd / peak).min()
 
 
-def curve_stats(curve: pd.Series, account_size: int) -> dict:
-    """Performance stats from an equity curve alone (works for buy-and-hold too)."""
+def sharpe(ret: pd.Series, years: float, annualize: bool = True) -> float:
+    """Single source of truth for the Sharpe ratio.
+
+    `ret` is a series of per-observation returns; `years` is the span the
+    observations cover. Annualisation scales by sqrt(observations / years).
+    """
+    s = ret.mean() / ret.std() if ret.std() > 0 else float("nan")
+    if annualize:
+        s *= np.sqrt(len(ret) / max(years, 1e-9))
+    return s
+
+
+def trade_sharpe(trades: pd.DataFrame, pnl_col: str = "PnL", annualize: bool = True) -> float:
+    """Sharpe from per-trade returns on capital deployed."""
+    # ret = trades[pnl_col] / (trades["Shares"] * trades["PriceIn"])
+    raw = (trades["PriceOut"] - trades["PriceIn"]) / trades["PriceIn"]
+    sign = np.where(trades["Side"].str.lower() == "short", -1, 1)
+    ret = raw * sign
+    years = (trades["DateOut"].max() - trades["DateIn"].min()).days / 365.25
+    return sharpe(ret, years, annualize)
+
+
+def series_sharpe(dClose: pd.Series, annualize: bool = True) -> float:
+    """Sharpe from a daily price/equity series (used for buy & hold)."""
+    ret = dClose.pct_change().dropna()
+    years = (ret.index[-1] - ret.index[0]).days / 365.25
+    return sharpe(ret, years, annualize)
+
+
+def curve_stats(curve: pd.Series, account_size: float, sharpe: float = np.nan) -> dict:
+    """Performance stats from an equity curve. Sharpe is supplied by the caller
+    (trade_sharpe for strategies, series_sharpe for buy & hold)."""
     years = max((curve.index[-1] - curve.index[0]).days / 365.25, 1e-9)
     final = curve.iloc[-1]
     net = final - account_size
     cagr = (final / account_size) ** (1 / years) - 1 if final > 0 else np.nan
     dd_abs, dd_pct = max_drawdown(curve)
-    daily_ret = curve.pct_change().dropna()
-    sharpe = (daily_ret.mean() / daily_ret.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-              if daily_ret.std() > 0 else np.nan)
     mar = (cagr / abs(dd_pct)) if (dd_pct and pd.notna(cagr)) else np.nan
     return {"years": years, "final": final, "net": net, "total_return": net / account_size,
             "cagr": cagr, "dd_abs": dd_abs, "dd_pct": dd_pct, "sharpe": sharpe, "mar": mar}
@@ -129,15 +155,19 @@ def trade_stats(trades: pd.DataFrame, pnl_col: str) -> dict:
         "skew": stats.skew(pnl), "kurt": stats.kurtosis(pnl),
         "top5_share": pnl.nlargest(n_top).sum() / net if net > 0 else np.nan,
         "exp_wo_best": pnl.drop(pnl.idxmax()).mean() if len(pnl) > 1 else np.nan,
+        "sharpe": trade_sharpe(trades, pnl_col),
     }
+
 
 def accounting_fmt(x):
     if pd.isna(x):
         return ""
     return f"({abs(x):,.2f}$)" if x < 0 else f"{x:,.2f}$"
 
+
 def red_if_negative(x):
     return "color: red" if (pd.notna(x) and x < 0) else ""
+
 
 def color_side(x):
     if x == "Long":
@@ -146,7 +176,8 @@ def color_side(x):
         return "color: green"
     return ""
 
-# ----------------------------------------f-----------------------------------
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.header("Run")
@@ -172,20 +203,19 @@ if view.empty:
     st.warning("No trades match the current slice.")
     st.stop()
 
-curve = equity_from_trades(view, pnl_col, trades["EquityAtEntry"].iloc[0])
-cs = curve_stats(curve, trades["EquityAtEntry"].iloc[0])
+start_equity = trades["EquityAtEntry"].iloc[0]
+curve = equity_from_trades(view, pnl_col, start_equity)
 ts = trade_stats(view, pnl_col)
+cs = curve_stats(curve, start_equity, sharpe=ts["sharpe"])
 
 # ---------------------------------------------------------------------------
 # Header + full PORTFOLIO ANALYSIS block
 # ---------------------------------------------------------------------------
 st.header("Portfolio analysis")
-st.caption(f"Period {curve.index[0].date()} -> {curve.index[-1].date()} "
-           f"({cs['years']:.2f} years)")
 
 st.subheader("Performance")
 p = st.columns(4)
-p[0].metric("Starting equity", f"${trades["EquityAtEntry"].iloc[0]:,.2f}")
+p[0].metric("Starting equity", f"${start_equity:,.2f}")
 p[1].metric("Net profit", f"${cs['net']:,.2f}")
 p[2].metric("Final equity", f"${cs['final']:,.2f}")
 p[3].metric("Total return", f"{cs['total_return']:.1%}")
@@ -193,7 +223,7 @@ p = st.columns(4)
 p[0].metric("CAGR", f"{cs['cagr']:.1%}" if pd.notna(cs["cagr"]) else "-")
 p[1].metric("Max drawdown ($)", f"{cs['dd_pct']:.1%}", f"{cs['dd_abs']:,.2f}")
 p[2].metric("MAR (CAGR/|MaxDD%|)", f"{cs['mar']:.2f}" if pd.notna(cs["mar"]) else "-")
-p[3].metric("Sharpe (daily, ann.)", f"{cs['sharpe']:.2f}" if pd.notna(cs["sharpe"]) else "-")
+p[3].metric("Sharpe (daily, ann.)", f"{ts['sharpe']:.2f}" if pd.notna(ts["sharpe"]) else "-")
 
 st.subheader("Trades")
 q = st.columns(4)
@@ -203,7 +233,15 @@ q[2].metric("Win rate", f"{ts['win_rate']:.1%}")
 q[3].metric("Average trade (exp.)", f"${ts['expectancy']:,.2f}")
 q = st.columns(4)
 q[0].metric("Average win", f"${ts['avg_win']:,.2f}")
+q[0].markdown(
+    f"<div style='margin-top:-30px; color:gray;'>({100*ts['avg_win']/(ts['avg_win']+abs(ts['avg_loss'])):,.2f}%)</div>",
+    unsafe_allow_html=True
+)
 q[1].metric("Average loss", f"${ts['avg_loss']:,.2f}")
+q[1].markdown(
+    f"<div style='margin-top:-30px; color:gray;'>({100*abs(ts['avg_loss'])/(ts['avg_win']+abs(ts['avg_loss'])):,.2f}%)</div>",
+    unsafe_allow_html=True
+)
 q[2].metric("Best / worst", f"\\${ts['best']:,.2f} / \\${ts['worst']:,.2f}")
 q[3].metric("Profit factor", f"{ts['pf']:.2f}")
 q = st.columns(4)
@@ -232,18 +270,15 @@ with tab_eq:
                         row_heights=[0.7, 0.3], vertical_spacing=0.06,
                         subplot_titles=(f"Equity - {choice}", "Drawdown"))
 
-    # fig.add_trace(go.Scatter(x=curve.index, y=curve.values, name=f"{choice} strategy",
-    #                          mode="lines", line=dict(width=2.6),
-    #                          hovertemplate="$%{y:,.0f}<extra></extra>"), row=1, col=1)
-       # --- selected ETF strategy: colour by side selection ------------------
+    # --- selected ETF strategy: colour by side selection ------------------
     long_sel = "Long" in sides
     short_sel = "Short" in sides
     BLUE = "#1f77b4"
 
     if long_sel and short_sel:
         # both sides -> three lines: green long, red short, blue combined
-        long_curve = equity_from_trades(view[view.Side == "Long"], pnl_col, trades["EquityAtEntry"].iloc[0])
-        short_curve = equity_from_trades(view[view.Side == "Short"], pnl_col, trades["EquityAtEntry"].iloc[0])
+        long_curve = equity_from_trades(view[view.Side == "Long"], pnl_col, start_equity)
+        short_curve = equity_from_trades(view[view.Side == "Short"], pnl_col, start_equity)
         if not long_curve.empty:
             fig.add_trace(go.Scatter(x=long_curve.index, y=long_curve.values,
                                      name=f"{choice} (Long)", mode="lines",
@@ -266,14 +301,13 @@ with tab_eq:
                                  line=dict(width=2.6, color=BLUE),
                                  hovertemplate="$%{y:,.0f}<extra></extra>"), row=1, col=1)
 
-
     if show_bh:
         dclose = load_daily_close(data_dir, choice)
         if dclose is None:
             st.warning(f"No price data for {choice} in `{data_dir}` - "
                        "buy & hold unavailable.")
         else:
-            bh = buy_hold_curve(dclose, trades["EquityAtEntry"].iloc[0])
+            bh = buy_hold_curve(dclose, start_equity)
             bh = bh[(bh.index >= curve.index[0]) & (bh.index <= curve.index[-1])]
             fig.add_trace(go.Scatter(x=bh.index, y=bh.values,
                                      name=f"{choice} buy & hold", mode="lines",
@@ -287,13 +321,13 @@ with tab_eq:
         if d.empty:
             continue
         c_ = equity_from_trades(d, pnl_col, d["EquityAtEntry"].iloc[0])
-        sym_cs = curve_stats(c_, d["EquityAtEntry"].iloc[0])
+        sym_sharpe = trade_sharpe(d, pnl_col)
         fig.add_trace(go.Scatter(x=c_.index, y=c_.values,
-                                 name=f"{sym} (sharpe: {sym_cs['sharpe']:,.2f})",
+                                 name=f"{sym} (sharpe: {sym_sharpe:,.2f})",
                                  mode="lines", line=dict(width=1.4),
                                  hovertemplate="$%{y:,.0f}<extra></extra>"), row=1, col=1)
 
-    fig.add_hline(y=trades["EquityAtEntry"].iloc[0], line_dash="dot", line_width=1, opacity=0.4, row=1, col=1)
+    fig.add_hline(y=start_equity, line_dash="dot", line_width=1, opacity=0.4, row=1, col=1)
 
     peak = curve.cummax()
     fig.add_trace(go.Scatter(x=curve.index, y=(curve - peak) / peak * 100,
@@ -308,12 +342,12 @@ with tab_eq:
     if show_bh:
         dclose = load_daily_close(data_dir, choice)
         if dclose is not None:
-            bh = buy_hold_curve(dclose, trades["EquityAtEntry"].iloc[0])
+            bh = buy_hold_curve(dclose, start_equity)
             bh = bh[(bh.index >= curve.index[0]) & (bh.index <= curve.index[-1])]
-            bhs = curve_stats(bh, trades["EquityAtEntry"].iloc[0])
+            bhs = curve_stats(bh, bh.iloc[0], sharpe=series_sharpe(dclose))
             cmp_df = pd.DataFrame({
                 f"{choice} strategy": [cs["net"], cs["total_return"], cs["cagr"],
-                                       cs["dd_pct"], cs["sharpe"], cs["mar"]],
+                                       cs["dd_pct"], ts["sharpe"], cs["mar"]],
                 f"{choice} buy & hold": [bhs["net"], bhs["total_return"], bhs["cagr"],
                                          bhs["dd_pct"], bhs["sharpe"], bhs["mar"]],
             }, index=["Net profit $", "Total return", "CAGR",
@@ -330,13 +364,8 @@ with tab_eq:
 
 with tab_dist:
     pnl_s = view[pnl_col]
-    pnl_a = pnl_s.to_numpy()
-    # lo, hi = \
-    #     pnl_s.mean() - 1.96 * pnl_s.std() / np.sqrt(len(pnl_s)),  \
-    #     pnl_s.mean() + 1.96 * pnl_s.std() / np.sqrt(len(pnl_s))  \
-    # lo, hi = stats.t.interval(0.95, len(pnl_s)-1, loc=np.mean(pnl_s), scale=stats.sem(pnl_s))
     se = pnl_s.std(ddof=1) / np.sqrt(len(pnl_s))
-    lo, hi = pnl_s.mean() - 1.96*se, pnl_s.mean() + 1.96*se
+    lo, hi = pnl_s.mean() - 1.96 * se, pnl_s.mean() + 1.96 * se
 
     # ---- summary of the trade distribution ------------------------------
     m = st.columns(4)
@@ -349,9 +378,6 @@ with tab_dist:
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=pnl_s, nbinsx=60, name="Trades",
                                histnorm="probability density"))
-    xs = np.linspace(pnl_s.min(), pnl_s.max(), 300)
-    # fig.add_trace(go.Scatter(x=xs, y=stats.norm.pdf(xs, pnl_s.mean(), pnl_s.std()),
-    #                          name="Normal fit", mode="lines"))
     fig.add_vline(x=pnl_s.mean(), line_dash="dash", line_color="red",
                   annotation_text=f"mean ${pnl_s.mean():.2f}")
     fig.add_vline(x=pnl_s.median(), line_dash="dot", line_color="green",
@@ -412,6 +438,5 @@ with tab_tbl:
         .map(color_side, subset=["Side"])
     )
     st.dataframe(styled, width='stretch', height=560)
-    # st.dataframe(view.sort_values("DateIn"), width='stretch', height=560)
     st.download_button("Download as CSV", view.to_csv(index=False),
                        f"{choice}_trades.csv", "text/csv")
